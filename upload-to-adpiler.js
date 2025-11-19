@@ -437,103 +437,36 @@ async function uploadSlidesToAd({ cardId, adId, attachments, meta, onlyThese }) 
   if (count === 0 && list.length > 0) throw new Error('No slides uploaded (check file accessibility).');
   return count;
 }
-// ---------- HTML5 ZIP HELPERS ----------
-
-// Detect ZIP attachments
-function _isZipName(n='') {
-  return /\.zip$/i.test(String(n||''));
-}
-
-// Upload HTML5 ZIP to AdPiler
-async function uploadHtml5Zip({ campaignId, card, zipBuffer, filename }) {
-  const form = new FormData();
-  form.append('name', card.name);
-  form.append('file', zipBuffer, { filename });
-  // AdPiler automatically unpacks and detects the size
-  // If needed you can ALSO add width/height here
-
-  const resp = await postForm(
-    `campaigns/${encodeURIComponent(campaignId)}/ads/html5`,
-    form
-  );
-
-  const adId = resp.id || resp.adId || resp.data?.id;
-  if (!adId) throw new Error(`HTML5 upload returned no ID. Keys=${Object.keys(resp)}`);
-
-  console.log(`✅ HTML5 ZIP uploaded → AdId=${adId}, File=${filename}`);
-  return adId;
-}
-
-// Collect ZIP attachments
-async function collectZipFiles(cardId, attachments=[]) {
-  const out = [];
-  for (const att of attachments) {
-    if (!att?.name || !_isZipName(att.name)) continue;
-    try {
-      const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
-      out.push({ buffer, filename });
-    } catch (e) {
-      console.warn(`ZIP download skipped (${att.name}): ${e.message}`);
-    }
-  }
-  return out;
-}
-
-// ---------- MAIN (UPDATED FOR HTML5 ZIP SUPPORT) ----------
+// ---------- MAIN (NO HTML5 ZIP VIA API) ----------
 async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   assertEnv();
 
   // Mapping
   let mapping;
-  try { mapping = await getClientMapping(card.name); }
-  catch (e) {
+  try {
+    mapping = await getClientMapping(card.name);
+  } catch (e) {
     console.warn(`Mapping lookup failed; using defaults. ${e.message}`);
     mapping = { clientId: DEFAULT_CLIENT_ID, campaignId: DEFAULT_PROJECT_ID, campaignCode: '' };
   }
   const campaignId = mapping.campaignId || mapping.projectId || DEFAULT_PROJECT_ID;
-  if (!campaignId)
+  if (!campaignId) {
     throw new Error('No campaignId found (CSV "Adpiler Campaign ID" or DEFAULT_PROJECT_ID required)');
+  }
 
   // Meta & paid
   const meta = extractAdMetaFromCard(card);
   const { paid } = decidePaid({ cardName: card.name });
 
-  // FIRST: detect ZIPs
-  const zipFiles = await collectZipFiles(card.id, attachments);
-
-  // If there is ANY ZIP file, upload ONLY the first one to AdPiler as HTML5
-  if (zipFiles.length > 0) {
-    const { buffer, filename } = zipFiles[0];
-
-    console.log(`🔍 ZIP detected → Uploading HTML5 ZIP: ${filename}`);
-
-    const html5AdId = await uploadHtml5Zip({
-      campaignId,
-      card,
-      zipBuffer: buffer,
-      filename
-    });
-
-    // Comment back to Trello
-    if (postTrelloComment) {
-      try {
-        await postTrelloComment(
-          card.id,
-          `✅ HTML5 ZIP uploaded\nAd ID: ${html5AdId}\nFile: ${filename}`
-        );
-      } catch {}
-    }
-
-    return {
-      adId: html5AdId,
-      mode: 'html5',
-      previewUrls: []
-    };
+  // NOTE: ZIP / HTML5 creatives
+  // In API mode the Adpiler API does NOT expose a working HTML5 endpoint.
+  // To avoid 404s, we simply ignore .zip attachments for now and log a note.
+  const zipCount = (attachments || []).filter(a => a?.name && /\.zip$/i.test(a.name)).length;
+  if (zipCount) {
+    console.log(
+      `ℹ️ Detected ${zipCount} .zip attachment(s). HTML5 ZIP upload is not supported via API mode; ZIPs are ignored.`
+    );
   }
-
-  // -------------------------------
-  // NO ZIP — continue normal logic
-  // -------------------------------
 
   const title = String(card.name || '');
   const wantsDisplayHint = /\bdisplay\b/i.test(title) || /\b300\D*600\b/i.test(title);
@@ -562,8 +495,9 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
     console.log(`Mode decided: ${mode}`);
 
     if (mode === 'display') {
-      if (!displayAsset)
+      if (!displayAsset) {
         throw new Error('Display mode selected but no 300x600 GIF/PNG found.');
+      }
 
       const lp = meta.url || '';
       displayAdId = await createDisplay300x600ViaAds({
@@ -583,8 +517,9 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
         '';
 
       const media = squareAssets[0] || firstVideo || firstAsset;
-      if (!media)
+      if (!media) {
         throw new Error('Post mode selected but no usable attachment found.');
+      }
 
       const { adId } = await createSocialAd({
         campaignId,
@@ -666,7 +601,7 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
     console.warn('Preview URL build warning:', e.message);
   }
 
-  // Comment
+  // Comment back to Trello
   if (postTrelloComment) {
     const lines = [];
 
@@ -704,5 +639,5 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   return out;
 }
 
-
 module.exports = { uploadToAdpiler };
+
