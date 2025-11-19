@@ -437,26 +437,107 @@ async function uploadSlidesToAd({ cardId, adId, attachments, meta, onlyThese }) 
   if (count === 0 && list.length > 0) throw new Error('No slides uploaded (check file accessibility).');
   return count;
 }
+// ---------- HTML5 ZIP HELPERS ----------
 
-// ---------- MAIN ----------
+// Detect ZIP attachments
+function _isZipName(n='') {
+  return /\.zip$/i.test(String(n||''));
+}
+
+// Upload HTML5 ZIP to AdPiler
+async function uploadHtml5Zip({ campaignId, card, zipBuffer, filename }) {
+  const form = new FormData();
+  form.append('name', card.name);
+  form.append('file', zipBuffer, { filename });
+  // AdPiler automatically unpacks and detects the size
+  // If needed you can ALSO add width/height here
+
+  const resp = await postForm(
+    `campaigns/${encodeURIComponent(campaignId)}/ads/html5`,
+    form
+  );
+
+  const adId = resp.id || resp.adId || resp.data?.id;
+  if (!adId) throw new Error(`HTML5 upload returned no ID. Keys=${Object.keys(resp)}`);
+
+  console.log(`✅ HTML5 ZIP uploaded → AdId=${adId}, File=${filename}`);
+  return adId;
+}
+
+// Collect ZIP attachments
+async function collectZipFiles(cardId, attachments=[]) {
+  const out = [];
+  for (const att of attachments) {
+    if (!att?.name || !_isZipName(att.name)) continue;
+    try {
+      const { buffer, filename } = await downloadAttachmentBuffer(cardId, att);
+      out.push({ buffer, filename });
+    } catch (e) {
+      console.warn(`ZIP download skipped (${att.name}): ${e.message}`);
+    }
+  }
+  return out;
+}
+
+// ---------- MAIN (UPDATED FOR HTML5 ZIP SUPPORT) ----------
 async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   assertEnv();
 
   // Mapping
   let mapping;
   try { mapping = await getClientMapping(card.name); }
-  catch (e) { console.warn(`Mapping lookup failed; using defaults. ${e.message}`); mapping = { clientId: DEFAULT_CLIENT_ID, campaignId: DEFAULT_PROJECT_ID, campaignCode: '' }; }
+  catch (e) {
+    console.warn(`Mapping lookup failed; using defaults. ${e.message}`);
+    mapping = { clientId: DEFAULT_CLIENT_ID, campaignId: DEFAULT_PROJECT_ID, campaignCode: '' };
+  }
   const campaignId = mapping.campaignId || mapping.projectId || DEFAULT_PROJECT_ID;
-  if (!campaignId) throw new Error('No campaignId found (CSV "Adpiler Campaign ID" or DEFAULT_PROJECT_ID required)');
+  if (!campaignId)
+    throw new Error('No campaignId found (CSV "Adpiler Campaign ID" or DEFAULT_PROJECT_ID required)');
 
   // Meta & paid
   const meta = extractAdMetaFromCard(card);
   const { paid } = decidePaid({ cardName: card.name });
 
-  // Decide mode (force / auto)
+  // FIRST: detect ZIPs
+  const zipFiles = await collectZipFiles(card.id, attachments);
+
+  // If there is ANY ZIP file, upload ONLY the first one to AdPiler as HTML5
+  if (zipFiles.length > 0) {
+    const { buffer, filename } = zipFiles[0];
+
+    console.log(`🔍 ZIP detected → Uploading HTML5 ZIP: ${filename}`);
+
+    const html5AdId = await uploadHtml5Zip({
+      campaignId,
+      card,
+      zipBuffer: buffer,
+      filename
+    });
+
+    // Comment back to Trello
+    if (postTrelloComment) {
+      try {
+        await postTrelloComment(
+          card.id,
+          `✅ HTML5 ZIP uploaded\nAd ID: ${html5AdId}\nFile: ${filename}`
+        );
+      } catch {}
+    }
+
+    return {
+      adId: html5AdId,
+      mode: 'html5',
+      previewUrls: []
+    };
+  }
+
+  // -------------------------------
+  // NO ZIP — continue normal logic
+  // -------------------------------
+
   const title = String(card.name || '');
   const wantsDisplayHint = /\bdisplay\b/i.test(title) || /\b300\D*600\b/i.test(title);
-  const forceMode = (ADPILER_FORCE_MODE || '').toLowerCase().trim(); // 'display' | 'post' | 'post-carousel'
+  const forceMode = (ADPILER_FORCE_MODE || '').toLowerCase().trim();
 
   let mode = forceMode || '';
   let socialAdId = '';
@@ -464,7 +545,6 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
   let uploadedCount = 0;
 
   try {
-    // Pre-scan
     const displayAsset = await pickDisplay300x600(card.id, attachments);
     const squareAssets = await collectSquareAssets(card.id, attachments);
     const nonDisplayImages = collectNonDisplayImages(attachments);
@@ -472,32 +552,48 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
     const firstAsset = await pickFirstAttachment(card.id, attachments);
 
     if (!mode) {
-      if (squareAssets.length >= 2)            mode = 'post-carousel';
-      else if (nonDisplayImages.length >= 2)   mode = 'post-carousel';   // fallback heuristic
-      else if (squareAssets.length === 1)      mode = 'post';
+      if (squareAssets.length >= 2) mode = 'post-carousel';
+      else if (nonDisplayImages.length >= 2) mode = 'post-carousel';
+      else if (squareAssets.length === 1) mode = 'post';
       else if (wantsDisplayHint || displayAsset) mode = 'display';
-      else                                     mode = 'post';
+      else mode = 'post';
     }
 
     console.log(`Mode decided: ${mode}`);
 
     if (mode === 'display') {
-      if (!displayAsset) throw new Error('Display mode selected but no 300x600 GIF/PNG found.');
+      if (!displayAsset)
+        throw new Error('Display mode selected but no 300x600 GIF/PNG found.');
+
       const lp = meta.url || '';
-      displayAdId = await createDisplay300x600ViaAds({ campaignId, card, asset: displayAsset, landingUrl: lp });
+      displayAdId = await createDisplay300x600ViaAds({
+        campaignId,
+        card,
+        asset: displayAsset,
+        landingUrl: lp
+      });
 
     } else if (mode === 'post') {
-      // Primary text fallback (never leave message empty)
-      const messageFallbackOk = String(USE_DESCRIPTION_AS_MESSAGE_FALLBACK).toLowerCase() !== 'false';
-      const primaryForMessage = (meta.primary && meta.primary.trim()) ||
-                                (messageFallbackOk ? (meta.description && meta.description.trim()) : '') || '';
+      const messageFallbackOk =
+        String(USE_DESCRIPTION_AS_MESSAGE_FALLBACK).toLowerCase() !== 'false';
 
-      // Create Social Ad (type=post), then upload exactly one slide.
-      // Preference: square image → first video → first attachment
+      const primaryForMessage =
+        (meta.primary && meta.primary.trim()) ||
+        (messageFallbackOk ? meta.description : '') ||
+        '';
+
       const media = squareAssets[0] || firstVideo || firstAsset;
-      if (!media) throw new Error('Post mode selected but no usable attachment found.');
+      if (!media)
+        throw new Error('Post mode selected but no usable attachment found.');
 
-      const { adId } = await createSocialAd({ campaignId, card, paid, type: 'post', primaryText: primaryForMessage });
+      const { adId } = await createSocialAd({
+        campaignId,
+        card,
+        paid,
+        type: 'post',
+        primaryText: primaryForMessage
+      });
+
       socialAdId = adId;
 
       await uploadSlidesToAd({
@@ -509,16 +605,29 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
       });
 
     } else if (mode === 'post-carousel') {
-      const messageFallbackOk = String(USE_DESCRIPTION_AS_MESSAGE_FALLBACK).toLowerCase() !== 'false';
-      const primaryForMessage = (meta.primary && meta.primary.trim()) ||
-                                (messageFallbackOk ? (meta.description && meta.description.trim()) : '') || '';
+      const messageFallbackOk =
+        String(USE_DESCRIPTION_AS_MESSAGE_FALLBACK).toLowerCase() !== 'false';
 
-      const { adId } = await createSocialAd({ campaignId, card, paid, type: 'post-carousel', primaryText: primaryForMessage });
+      const primaryForMessage =
+        (meta.primary && meta.primary.trim()) ||
+        (messageFallbackOk ? meta.description : '') ||
+        '';
+
+      const { adId } = await createSocialAd({
+        campaignId,
+        card,
+        paid,
+        type: 'post-carousel',
+        primaryText: primaryForMessage
+      });
+
       socialAdId = adId;
 
-      // Slides: prefer squares → else non-display images → else everything (images only)
-      const slideSet = squareAssets.length ? squareAssets
-                        : (nonDisplayImages.length ? nonDisplayImages : attachments.filter(a => a?.name && _isImageName(a.name)));
+      const slideSet = squareAssets.length
+        ? squareAssets
+        : nonDisplayImages.length
+        ? nonDisplayImages
+        : attachments.filter(a => a?.name && _isImageName(a.name));
 
       uploadedCount = await uploadSlidesToAd({
         cardId: card.id,
@@ -527,51 +636,73 @@ async function uploadToAdpiler(card, attachments, { postTrelloComment } = {}) {
         meta,
         onlyThese: slideSet
       });
-
-    } else {
-      throw new Error(`Unknown mode "${mode}"`);
     }
+
   } catch (e) {
     console.error('Uploader error:', e.message);
     throw e;
   }
 
-  // Preview URL (social ads)
+  // Build preview URL
   let previewUrl = '';
   try {
     if (socialAdId) {
-      let campaignCode = mapping.campaignCode || ADPILER_CAMPAIGN_CODE_OVERRIDE || '';
-      if (!campaignCode) campaignCode = await getCampaignCodeViaApi(campaignId);
-      if (campaignCode) previewUrl = buildPreviewUrl({ domain: ADPILER_PREVIEW_DOMAIN, campaignCode, adId: socialAdId });
-    }
-  } catch (e) { console.warn('Preview URL build warning:', e.message); }
+      let campaignCode =
+        mapping.campaignCode || ADPILER_CAMPAIGN_CODE_OVERRIDE || '';
 
-  // Trello comment
-  if (postTrelloComment) {
-    const lines = [];
-    if (socialAdId && mode === 'post') {
-      lines.push(`✅ Social POST (social-ads + 1 slide) id: ${socialAdId}, paid: ${paid ? 'true' : 'false'}.`);
+      if (!campaignCode) {
+        campaignCode = await getCampaignCodeViaApi(campaignId);
+      }
+
+      if (campaignCode) {
+        previewUrl = buildPreviewUrl({
+          domain: ADPILER_PREVIEW_DOMAIN,
+          campaignCode,
+          adId: socialAdId
+        });
+      }
     }
-    if (socialAdId && mode === 'post-carousel') {
-      lines.push(`✅ Social POST CAROUSEL (social-ads) id: ${socialAdId}, slides uploaded: ${uploadedCount}.`);
-    }
-    if (displayAdId && mode === 'display') {
-      lines.push(`✅ DISPLAY 300x600 (/ads) id: ${displayAdId}.`);
-    }
-    lines.push('—');
-    if (meta.primary)  lines.push(`Primary Text: ${meta.primary.substring(0,120)}${meta.primary.length>120?'…':''}`);
-    if (meta.headline) lines.push(`Headline: ${meta.headline}`);
-    if (meta.cta)      lines.push(`CTA: ${meta.cta}`);
-    if (meta.url)      lines.push(`URL: ${meta.url}`);
-    if (previewUrl)    lines.push(previewUrl);
-    try { await postTrelloComment(card.id, lines.join('\n')); } catch {}
+  } catch (e) {
+    console.warn('Preview URL build warning:', e.message);
   }
 
+  // Comment
+  if (postTrelloComment) {
+    const lines = [];
+
+    if (socialAdId && mode === 'post') {
+      lines.push(
+        `✅ Social POST uploaded (1 slide)\nAd ID: ${socialAdId}, Paid: ${paid}`
+      );
+    }
+    if (socialAdId && mode === 'post-carousel') {
+      lines.push(
+        `✅ Social POST CAROUSEL uploaded (${uploadedCount} slides)\nAd ID: ${socialAdId}`
+      );
+    }
+    if (displayAdId && mode === 'display') {
+      lines.push(`✅ DISPLAY 300x600 uploaded\nAd ID: ${displayAdId}`);
+    }
+
+    lines.push('—');
+    if (meta.primary) lines.push(`Primary: ${meta.primary}`);
+    if (meta.headline) lines.push(`Headline: ${meta.headline}`);
+    if (meta.cta) lines.push(`CTA: ${meta.cta}`);
+    if (meta.url) lines.push(`URL: ${meta.url}`);
+    if (previewUrl) lines.push(previewUrl);
+
+    try {
+      await postTrelloComment(card.id, lines.join('\n'));
+    } catch {}
+  }
+
+  // Output
   const out = { previewUrls: previewUrl ? [previewUrl] : [] };
   if (socialAdId) out.adId = socialAdId;
   if (displayAdId) out.displayAdId = displayAdId;
   out.mode = mode;
   return out;
 }
+
 
 module.exports = { uploadToAdpiler };
