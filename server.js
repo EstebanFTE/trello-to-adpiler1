@@ -28,7 +28,7 @@ async function processQueue() {
   processing = false;
 }
 const lastRun = new Map();
-const COOLDOWN_MS = 2 * 60 * 1000;
+const COOLDOWN_MS = 3000;
 
 const normalize = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 const READY_LIST_NAME = normalize(process.env.READY_LIST_NAME || 'Ready For AdPiler');
